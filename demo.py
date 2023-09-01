@@ -4,43 +4,40 @@ sys.path.append('droid_slam')
 from tqdm import tqdm
 import numpy as np
 import torch
-import lietorch
 import cv2
 import os
-import glob 
-import time
+import json
 import argparse
 
-from torch.multiprocessing import Process
 from droid import Droid
+from scipy.spatial.transform import Rotation
 
-import torch.nn.functional as F
-
+def pose_matrix_from_quaternion(pvec):
+    """ convert 4x4 pose matrix to (t, q) """
+    pose = np.eye(4)
+    pose[:3,:3] = Rotation.from_quat(pvec[3:]).as_matrix()
+    pose[:3, 3] = pvec[:3]
+    return pose
 
 def show_image(image):
     image = image.permute(1, 2, 0).cpu().numpy()
     cv2.imshow('image', image / 255.0)
     cv2.waitKey(1)
 
-def image_stream(imagedir, calib, stride):
+def image_stream(data, stride):
     """ image generator """
-
-    calib = np.loadtxt(calib, delimiter=" ")
-    fx, fy, cx, cy = calib[:4]
-
-    K = np.eye(3)
-    K[0,0] = fx
-    K[0,2] = cx
-    K[1,1] = fy
-    K[1,2] = cy
-
-    image_list = sorted(os.listdir(imagedir))[::stride]
-
+    # Read json from {data}/transforms.json
+    with open(os.path.join(data, 'transforms.json'), 'r') as f:
+        transforms = json.load(f)
+    fx, fy = transforms['fl_x'], transforms['fl_y']
+    cx, cy = transforms['cx'], transforms['cy']
+    
+    image_list = []
+    for _frame in transforms['frames']:
+        image_list.append(_frame['file_path'])
+    
     for t, imfile in enumerate(image_list):
-        image = cv2.imread(os.path.join(imagedir, imfile))
-        if len(calib) > 4:
-            image = cv2.undistort(image, K, calib[4:])
-
+        image = cv2.imread(os.path.join(data, imfile))
         h0, w0, _ = image.shape
         h1 = int(h0 * np.sqrt((384 * 512) / (h0 * w0)))
         w1 = int(w0 * np.sqrt((384 * 512) / (h0 * w0)))
@@ -56,31 +53,70 @@ def image_stream(imagedir, calib, stride):
         yield t, image[None], intrinsics
 
 
-def save_reconstruction(droid, reconstruction_path):
-
-    from pathlib import Path
-    import random
-    import string
-
+def save_reconstruction(droid, output_dir):
     t = droid.video.counter.value
     tstamps = droid.video.tstamp[:t].cpu().numpy()
-    images = droid.video.images[:t].cpu().numpy()
-    disps = droid.video.disps_up[:t].cpu().numpy()
-    poses = droid.video.poses[:t].cpu().numpy()
-    intrinsics = droid.video.intrinsics[:t].cpu().numpy()
+    images = droid.video.images[:t].cpu().numpy() # [N, 3, 384, 512]
+    disps = droid.video.disps_up[:t].cpu().numpy() # [N, 384, 512]
+    poses = droid.video.poses[:t].cpu().numpy() # [N, 7]
+    intrinsics = droid.video.intrinsics[:t].cpu().numpy() # [N, 4]
+    
+    # transfer [fx fy cx cy] to 4x4 intrinsics matrix
+    intrinsics = intrinsics[0] # [fx fy cx cy]
+    intrinsics_4x4 = np.eye(4)
+    intrinsics_4x4[0, 0] = intrinsics[0]  # fx
+    intrinsics_4x4[1, 1] = intrinsics[1]  # fy
+    intrinsics_4x4[0, 2] = intrinsics[2]  # cx
+    intrinsics_4x4[1, 2] = intrinsics[3]  # cy
 
-    Path("reconstructions/{}".format(reconstruction_path)).mkdir(parents=True, exist_ok=True)
-    np.save("reconstructions/{}/tstamps.npy".format(reconstruction_path), tstamps)
-    np.save("reconstructions/{}/images.npy".format(reconstruction_path), images)
-    np.save("reconstructions/{}/disps.npy".format(reconstruction_path), disps)
-    np.save("reconstructions/{}/poses.npy".format(reconstruction_path), poses)
-    np.save("reconstructions/{}/intrinsics.npy".format(reconstruction_path), intrinsics)
+    os.makedirs(f'{output_dir}/pose', exist_ok=True)
+    os.makedirs(f'{output_dir}/color', exist_ok=True)
+    os.makedirs(f'{output_dir}/depth', exist_ok=True)
+    os.makedirs(f'{output_dir}/intrinsic', exist_ok=True)
 
+    transformed_data = {
+        "w": int(images[0].shape[2]),
+        "h": int(images[0].shape[1]),
+        "fl_x": float(intrinsics[0]) * 8.0,
+        "fl_y": float(intrinsics[1]) * 8.0,
+        "cx": float(intrinsics[2]) * 8.0,
+        "cy": float(intrinsics[3]) * 8.0,
+        "k1": 0,
+        "k2": 0,
+        "p1": 0,
+        "p2": 0,
+        "camera_model": "OPENCV",
+        "frames": []
+    }
 
+    # save images, poses, intrinsics
+    for _id  in tqdm(range(t)):
+        pose = np.linalg.inv(pose_matrix_from_quaternion(poses[_id]))
+        pose[:, 2] *= -1
+        pose[:, 1] *= -1
+        image = images[_id]
+        image = image.transpose(1, 2, 0)
+        depth = (disps[_id] * 1000).astype(np.uint16)
+        np.savetxt(f'{output_dir}/pose/{_id}.txt', pose)
+        cv2.imwrite(f'{output_dir}/color/{_id}.jpg', image)
+        cv2.imwrite(f'{output_dir}/depth/{_id}.png', depth)
+        np.savetxt(f'{output_dir}/intrinsic/intrinsic_color.txt', intrinsics_4x4)
+        np.savetxt(f'{output_dir}/intrinsic/intrinsic_depth.txt', intrinsics_4x4)
+
+        
+        transformed_frame = {
+            "file_path": f"color/{_id}.png",
+            "transform_matrix": pose.tolist(),
+        }
+        transformed_data['frames'].append(transformed_frame)
+        output_data_path = os.path.join(output_dir, 'transforms.json')
+        with open(output_data_path, 'w') as f:
+            f.write(json.dumps(transformed_data, indent=4))
+        
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--imagedir", type=str, help="path to image directory")
-    parser.add_argument("--calib", type=str, help="path to calibration file")
+    parser.add_argument("--data", type=str, help="path to data directory")
+    parser.add_argument("--output_dir", help="path to saved reconstruction")
     parser.add_argument("--t0", default=0, type=int, help="starting frame")
     parser.add_argument("--stride", default=3, type=int, help="frame stride")
 
@@ -102,7 +138,6 @@ if __name__ == '__main__':
     parser.add_argument("--backend_radius", type=int, default=2)
     parser.add_argument("--backend_nms", type=int, default=3)
     parser.add_argument("--upsample", action="store_true")
-    parser.add_argument("--reconstruction_path", help="path to saved reconstruction")
     args = parser.parse_args()
 
     args.stereo = False
@@ -111,11 +146,11 @@ if __name__ == '__main__':
     droid = None
 
     # need high resolution depths
-    if args.reconstruction_path is not None:
+    if args.output_dir is not None:
         args.upsample = True
 
     tstamps = []
-    for (t, image, intrinsics) in tqdm(image_stream(args.imagedir, args.calib, args.stride)):
+    for (t, image, intrinsics) in tqdm(image_stream(args.data, args.stride)):
         if t < args.t0:
             continue
 
@@ -128,7 +163,7 @@ if __name__ == '__main__':
         
         droid.track(t, image, intrinsics=intrinsics)
 
-    if args.reconstruction_path is not None:
-        save_reconstruction(droid, args.reconstruction_path)
+    if args.output_dir is not None:
+        save_reconstruction(droid, args.output_dir)
 
-    traj_est = droid.terminate(image_stream(args.imagedir, args.calib, args.stride))
+    traj_est = droid.terminate(image_stream(args.data, args.stride))
