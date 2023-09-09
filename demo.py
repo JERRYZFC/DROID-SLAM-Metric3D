@@ -24,7 +24,7 @@ def show_image(image):
     cv2.imshow('image', image / 255.0)
     cv2.waitKey(1)
 
-def image_stream(data, stride):
+def image_stream(data, stride, use_depth=False):
     """ image generator """
     # Read json from {data}/transforms.json
     with open(os.path.join(data, 'transforms.json'), 'r') as f:
@@ -44,14 +44,20 @@ def image_stream(data, stride):
 
         image = cv2.resize(image, (w1, h1))
         image = image[:h1-h1%8, :w1-w1%8]
+        if use_depth:
+            depth = depth_model.infer_pil(image)
+
         image = torch.as_tensor(image).permute(2, 0, 1)
 
         intrinsics = torch.as_tensor([fx, fy, cx, cy])
         intrinsics[0::2] *= (w1 / w0)
         intrinsics[1::2] *= (h1 / h0)
 
-        yield t, image[None], intrinsics
-
+        if use_depth:
+            depth = torch.as_tensor(depth)
+            yield t, image[None], intrinsics, depth
+        else:
+            yield t, image[None], intrinsics
 
 def save_reconstruction(droid, output_dir):
     t = droid.video.counter.value
@@ -138,10 +144,15 @@ if __name__ == '__main__':
     parser.add_argument("--backend_radius", type=int, default=2)
     parser.add_argument("--backend_nms", type=int, default=3)
     parser.add_argument("--upsample", action="store_true")
+    parser.add_argument("--use_depth", action="store_true")
     args = parser.parse_args()
 
     args.stereo = False
     torch.multiprocessing.set_start_method('spawn')
+
+    if args.use_depth:
+        DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+        depth_model = torch.hub.load('isl-org/ZoeDepth', "ZoeD_N", pretrained=True).to(DEVICE).eval()
 
     droid = None
 
@@ -150,7 +161,7 @@ if __name__ == '__main__':
         args.upsample = True
 
     tstamps = []
-    for (t, image, intrinsics) in tqdm(image_stream(args.data, args.stride)):
+    for (t, image, intrinsics, depth) in tqdm(image_stream(args.data, args.stride, args.use_depth)):
         if t < args.t0:
             continue
 
@@ -161,9 +172,8 @@ if __name__ == '__main__':
             args.image_size = [image.shape[2], image.shape[3]]
             droid = Droid(args)
         
-        droid.track(t, image, intrinsics=intrinsics)
+        droid.track(t, image, depth, intrinsics=intrinsics)
 
     if args.output_dir is not None:
         save_reconstruction(droid, args.output_dir)
 
-    traj_est = droid.terminate(image_stream(args.data, args.stride))
