@@ -8,7 +8,10 @@ import cv2
 import os
 import json
 import argparse
-
+import glob
+from PIL import Image as PILImage
+from PIL.ExifTags import GPSTAGS, TAGS
+from pathlib import Path
 from droid import Droid
 from scipy.spatial.transform import Rotation
 
@@ -24,20 +27,137 @@ def show_image(image):
     cv2.imshow('image', image / 255.0)
     cv2.waitKey(1)
 
+IMG_EXTENSIONS = ["png", "PNG", "jpg", "JPG"]
+def get_sorted_image_names_in_dir(dir_path: str):
+    image_paths = []
+    for extension in IMG_EXTENSIONS:
+        search_path = os.path.join(dir_path, f"*.{extension}")
+        image_paths.extend(glob.glob(search_path))
+
+    return sorted(image_paths)
+
+
+def __compute_sensor_width_from_exif(exif_data) -> float:
+        """Compute sensor_width_mm from `ExifImageWidth` tag,
+
+        Equation: sensor_width = pixel_x_dim / focal_plane_x_res * unit_conversion_factor
+
+        Returns:
+            sensor_width_mm.
+        """
+
+        sensor_width_mm = 0.0
+
+        # Read `ExifImageWidth` and `FocalPlaneXResolution`.
+        pixel_x_dim = exif_data.get("ExifImageWidth")
+        focal_plane_x_res = exif_data.get("FocalPlaneXResolution")
+        focal_plane_res_unit = exif_data.get("FocalPlaneResolutionUnit")
+        if (
+            pixel_x_dim is not None
+            and pixel_x_dim > 0
+            and focal_plane_x_res is not None
+            and focal_plane_x_res > 0
+            and focal_plane_res_unit is not None
+            and focal_plane_res_unit > 0
+        ):
+            ccd_width = pixel_x_dim / focal_plane_x_res
+
+            if focal_plane_res_unit == CENTIMETERS_FOCAL_PLANE_RES_UNIT:
+                sensor_width_mm = ccd_width * 10.0  # convert cm to mm
+            elif focal_plane_res_unit == INCHES_FOCAL_PLANE_RES_UNIT:
+                sensor_width_mm = ccd_width * MILLIMETERS_PER_INCH  # convert inch to mm
+
+        return sensor_width_mm
+    
+def get_intrinsics_from_exif(exif_data, img_w_px, img_h_px):
+    """Constructs the camera intrinsics from exif tag.
+
+    Equation: focal_px=max(w_px,h_px)∗focal_mm / ccdw_mm
+
+    Ref:
+    - https://www.awaresystems.be/imaging/tiff/tifftags/privateifd/exif.html
+    - https://github.com/colmap/colmap/blob/e3948b2098b73ae080b97901c3a1f9065b976a45/src/util/bitmap.cc#L282
+    - https://openmvg.readthedocs.io/en/latest/software/SfM/SfMInit_ImageListing/
+    - https://photo.stackexchange.com/questions/40865/how-can-i-get-the-image-sensor-dimensions-in-mm-to-get-circle-of-confusion-from # noqa: E501
+
+    Returns:
+        intrinsics matrix (3x3).
+    """
+    max_size = max(img_w_px, img_h_px)
+
+    # Initialize principal point.
+    center_x = img_w_px / 2
+    center_y = img_h_px / 2
+
+    # Initialize focal length as None.
+    focal_length_px = None
+
+    # Read from `FocalLengthIn35mmFilm`.
+    focal_length_35_mm = exif_data.get("FocalLengthIn35mmFilm")
+    if focal_length_35_mm is not None and focal_length_35_mm > 0:
+        focal_length_px = focal_length_35_mm / 35.0 * max_size
+    else:
+        # Read from `FocalLength` mm.
+        focal_length_mm = exif_data.get("FocalLength")
+        if focal_length_mm is None or focal_length_mm <= 0:
+            return None
+
+        # Compute sensor width, either from database or from EXIF.
+        sensor_width_mm = __compute_sensor_width_from_exif(exif_data)
+        if sensor_width_mm > 0.0:
+            focal_length_px = focal_length_mm / sensor_width_mm * max_size
+
+    if focal_length_px is None or focal_length_px <= 0.0:
+        return None
+
+    return focal_length_px, focal_length_px, float(center_x), float(center_y)
+
+def load_image(img_path: str, return_intrinsics=False):
+    """Load the image from disk.
+
+    Notes: EXIF is read as a map from (tag_id, value) where tag_id is an integer.
+    In order to extract human-readable names, we use the lookup table TAGS or GPSTAGS.
+    Images will be converted to RGB if in a different format.
+
+    Args:
+        img_path (str): the path of image to load.
+
+    Returns:
+        loaded image in RGB format.
+    """
+    original_image = PILImage.open(img_path)
+
+    exif_data = original_image._getexif()
+    if exif_data is not None:
+        parsed_data = {}
+        for tag_id, value in exif_data.items():
+            # extract the human readable tag name
+            if tag_id in TAGS:
+                tag_name = TAGS.get(tag_id)
+            elif tag_id in GPSTAGS:
+                tag_name = GPSTAGS.get(tag_id)
+            else:
+                tag_name = tag_id
+            parsed_data[tag_name] = value
+
+        exif_data = parsed_data
+        
+    img_fname = Path(img_path).name
+    image_array = np.array(original_image)
+    bgr_image_array = image_array[:, :, ::-1]
+    if return_intrinsics:
+        return bgr_image_array, get_intrinsics_from_exif(exif_data, original_image.size[0], original_image.size[1])
+    else:
+        return bgr_image_array
+
 def image_stream(data, stride, use_depth=False):
     """ image generator """
-    # Read json from {data}/transforms.json
-    with open(os.path.join(data, 'transforms.json'), 'r') as f:
-        transforms = json.load(f)
-    fx, fy = transforms['fl_x'], transforms['fl_y']
-    cx, cy = transforms['cx'], transforms['cy']
+    all_image_paths = get_sorted_image_names_in_dir(data)
+    num_all_imgs = len(all_image_paths)
+    _, (fx, fy, cx, cy) = load_image(all_image_paths[0], return_intrinsics=True)
     
-    image_list = []
-    for _frame in transforms['frames']:
-        image_list.append(_frame['file_path'])
-    
-    for t, imfile in enumerate(image_list):
-        image = cv2.imread(os.path.join(data, imfile))
+    for t, imfile in enumerate(all_image_paths):
+        image = load_image(imfile)
         h0, w0, _ = image.shape
         h1 = int(h0 * np.sqrt((384 * 512) / (h0 * w0)))
         w1 = int(w0 * np.sqrt((384 * 512) / (h0 * w0)))
@@ -57,7 +177,7 @@ def image_stream(data, stride, use_depth=False):
             depth = torch.as_tensor(depth)
             yield t, image[None], intrinsics, depth
         else:
-            yield t, image[None], intrinsics
+            yield t, image[None], intrinsics, None
 
 def save_reconstruction(droid, output_dir):
     t = droid.video.counter.value
@@ -109,7 +229,6 @@ def save_reconstruction(droid, output_dir):
         np.savetxt(f'{output_dir}/intrinsic/intrinsic_color.txt', intrinsics_4x4)
         np.savetxt(f'{output_dir}/intrinsic/intrinsic_depth.txt', intrinsics_4x4)
 
-        
         transformed_frame = {
             "file_path": f"color/{_id}.png",
             "transform_matrix": pose.tolist(),
